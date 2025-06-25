@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    app: default-http-backend
+    test: managed
+  name: default-http-1
+  namespace: second
+spec:
+  containers:
+  - image: gcr.io/google_containers/defaultbackend:1.4
+    imagePullPolicy: IfNotPresent
+    name: default-http-backend
+    ports:
+    - containerPort: 8080
+      protocol: TCP

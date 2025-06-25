@@ -24,6 +24,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/cli-runtime/pkg/printers"
@@ -76,7 +77,13 @@ func (p *pruner) pruneAll(o *ApplyOptions) error {
 		return fmt.Errorf("error retrieving RESTMappings to prune: %v", err)
 	}
 
-	for n := range p.visitedNamespaces {
+	// Determine which namespaces to check for pruning
+	namespacesToPrune, err := p.getNamespacesToPrune(o)
+	if err != nil {
+		return fmt.Errorf("error determining namespaces to prune: %v", err)
+	}
+
+	for _, n := range namespacesToPrune {
 		for _, m := range namespacedRESTMappings {
 			if err := p.prune(n, m); err != nil {
 				return fmt.Errorf("error pruning namespaced object %v: %v", m.GroupVersionKind, err)
@@ -159,4 +166,141 @@ func asDeleteOptions(cascadingStrategy metav1.DeletionPropagation, gracePeriod i
 	}
 	options.PropagationPolicy = &cascadingStrategy
 	return options
+}
+
+// getNamespacesToPrune returns the set of namespaces that should be checked for pruning.
+// This includes visited namespaces from the current apply operation and any additional
+// namespaces that contain resources matching the label selector.
+func (p *pruner) getNamespacesToPrune(o *ApplyOptions) ([]string, error) {
+	namespacesToPrune := sets.New[string]()
+
+	// Always include visited namespaces from the current apply operation
+	namespacesToPrune.Insert(sets.List(p.visitedNamespaces)...)
+
+	// If a specific namespace is set, only consider that namespace
+	if o.Namespace != "" {
+		namespacesToPrune.Insert(o.Namespace)
+		return sets.List(namespacesToPrune), nil
+	}
+
+	// If no specific namespace and we have a label selector, find all namespaces
+	// that contain resources matching the selector
+	if p.labelSelector != "" {
+		namespacesWithMatchingResources, err := p.findNamespacesWithMatchingResources(o)
+		if err != nil {
+			return nil, err
+		}
+		namespacesToPrune.Insert(namespacesWithMatchingResources...)
+	}
+
+	return sets.List(namespacesToPrune), nil
+}
+
+// findNamespacesWithMatchingResources finds all namespaces that contain resources
+// matching the label selector
+func (p *pruner) findNamespacesWithMatchingResources(o *ApplyOptions) ([]string, error) {
+	namespacesWithResources := sets.New[string]()
+
+	namespacedRESTMappings, _, err := prune.GetRESTMappings(o.Mapper, o.PruneResources, o.Namespace != "")
+	if err != nil {
+		return nil, err
+	}
+
+	// Get all namespaces
+	namespaceList, err := p.dynamicClient.Resource(schema.GroupVersionResource{
+		Group:    "",
+		Version:  "v1",
+		Resource: "namespaces",
+	}).List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list namespaces: %v", err)
+	}
+
+	namespaces, err := meta.ExtractList(namespaceList)
+	if err != nil {
+		return nil, err
+	}
+
+	// Check each namespace for resources matching the label selector
+	for _, nsObj := range namespaces {
+		nsMetadata, err := meta.Accessor(nsObj)
+		if err != nil {
+			continue
+		}
+		nsName := nsMetadata.GetName()
+
+		// Skip system namespaces unless they were explicitly visited
+		if isSystemNamespace(nsName) && !p.visitedNamespaces.Has(nsName) {
+			continue
+		}
+
+		// Check if this namespace has any resources matching our criteria
+		hasMatchingResources, err := p.namespaceHasMatchingResources(nsName, namespacedRESTMappings)
+		if err != nil {
+			// Log error but continue with other namespaces
+			continue
+		}
+
+		if hasMatchingResources {
+			namespacesWithResources.Insert(nsName)
+		}
+	}
+
+	return sets.List(namespacesWithResources), nil
+}
+
+// namespaceHasMatchingResources checks if a namespace contains any resources
+// that match the label selector and have the last-applied-config annotation
+func (p *pruner) namespaceHasMatchingResources(namespace string, mappings []*meta.RESTMapping) (bool, error) {
+	for _, mapping := range mappings {
+		objList, err := p.dynamicClient.Resource(mapping.Resource).
+			Namespace(namespace).
+			List(context.TODO(), metav1.ListOptions{
+				LabelSelector: p.labelSelector,
+				FieldSelector: p.fieldSelector,
+			})
+		if err != nil {
+			// If we can't list this resource type, skip it
+			continue
+		}
+
+		objs, err := meta.ExtractList(objList)
+		if err != nil {
+			continue
+		}
+
+		// Check if any objects have the last-applied-config annotation
+		for _, obj := range objs {
+			metadata, err := meta.Accessor(obj)
+			if err != nil {
+				continue
+			}
+
+			annots := metadata.GetAnnotations()
+			if _, ok := annots[corev1.LastAppliedConfigAnnotation]; ok {
+				return true, nil
+			}
+		}
+	}
+
+	return false, nil
+}
+
+// isSystemNamespace returns true if the namespace is a system namespace
+// that should be excluded from pruning unless explicitly visited
+func isSystemNamespace(namespace string) bool {
+	systemNamespaces := []string{
+		"kube-system",
+		"kube-public",
+		"kube-node-lease",
+		"default",
+	}
+
+	for _, sysNs := range systemNamespaces {
+		if namespace == sysNs {
+			return true
+		}
+	}
+
+	return false
 }
