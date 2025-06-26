@@ -24,6 +24,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/cli-runtime/pkg/genericiooptions"
 	"k8s.io/cli-runtime/pkg/resource"
@@ -69,50 +70,63 @@ func TestPruneTwoNamespaces(t *testing.T) {
 		NegotiatedSerializer: resource.UnstructuredPlusDefaultContentConfig().NegotiatedSerializer,
 		Client: fake.CreateHTTPClient(func(req *http.Request) (*http.Response, error) {
 			switch p, m := req.URL.Path, req.Method; {
-			case p == "/api/v1/namespaces/first" && m == "GET":
+			case strings.HasPrefix(p, "/api/v1/namespaces/") && m == "GET":
+				namespace := strings.TrimPrefix(p, "/api/v1/namespaces/")
 				// Return namespace exists
 				nsResponse := `{
 					"kind": "Namespace",
 					"apiVersion": "v1",
 					"metadata": {
-						"name": "first"
+						"name": "` + namespace + `"
 					}
 				}`
-				return &http.Response{StatusCode: http.StatusOK, Header: cmdtesting.DefaultHeader(), Body: io.NopCloser(strings.NewReader(nsResponse))}, nil
-			case p == "/api/v1/namespaces/second" && m == "GET":
-				// Return namespace exists
-				nsResponse := `{
-					"kind": "Namespace",
-					"apiVersion": "v1",
-					"metadata": {
-						"name": "second"
-					}
-				}`
-				return &http.Response{StatusCode: http.StatusOK, Header: cmdtesting.DefaultHeader(), Body: io.NopCloser(strings.NewReader(nsResponse))}, nil
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     cmdtesting.DefaultHeader(),
+					Body:       io.NopCloser(strings.NewReader(nsResponse))}, nil
 
-			// All the GETs
-			case p == urlFirstPod && (m == "GET" || m == "PATCH"):
-				podBytes, _ := runtime.Encode(codecPrune, podFirst)
-				bodyPod := io.NopCloser(bytes.NewReader(podBytes))
-				return &http.Response{StatusCode: http.StatusOK, Header: cmdtesting.DefaultHeader(), Body: bodyPod}, nil
-			case p == urlSecondPod1 && (m == "GET" || m == "PATCH"):
-				podBytes, _ := runtime.Encode(codecPrune, podSecond1)
-				bodyPod := io.NopCloser(bytes.NewReader(podBytes))
-				return &http.Response{StatusCode: http.StatusOK, Header: cmdtesting.DefaultHeader(), Body: bodyPod}, nil
-			case p == urlSecondPod2 && (m == "GET" || m == "PATCH"):
-				podBytes, _ := runtime.Encode(codecPrune, podSecond2)
-				bodyPod := io.NopCloser(bytes.NewReader(podBytes))
-				return &http.Response{StatusCode: http.StatusOK, Header: cmdtesting.DefaultHeader(), Body: bodyPod}, nil
+			// All the GETs return 404
+			// the reason is that if we return the objects here kubectl decides that they already
+			// exist and tries to do a patch.
+			case (p == urlFirstPod || p == urlSecondPod1 || p == urlSecondPod2) && m == "GET":
+				// Simulate not found for GET and PATCH
+				return &http.Response{
+					StatusCode: http.StatusNotFound,
+					Header:     cmdtesting.DefaultHeader(),
+					Body:       io.NopCloser(strings.NewReader(``)),
+				}, nil
 
 			// All the POSTs
 			case p == firstPodsCollection && m == "POST":
 				// Create the pod in first namespace
+				setLastAppliedConfigAnnotation(podFirst)
 				podBytes, _ := runtime.Encode(codecPrune, podFirst)
 				bodyPod := io.NopCloser(bytes.NewReader(podBytes))
 				return &http.Response{StatusCode: http.StatusCreated, Header: cmdtesting.DefaultHeader(), Body: bodyPod}, nil
 			case p == secondPodsCollection && m == "POST":
 				// Create the pod in second namespace
-				podBytes, _ := runtime.Encode(codecPrune, podSecond1)
+				bodyBytes, err := io.ReadAll(req.Body)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				obj := &unstructured.Unstructured{}
+				if err := runtime.DecodeInto(codecPrune, bodyBytes, obj); err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+
+				var podToReturn *unstructured.Unstructured
+				switch obj.GetName() {
+				case "p21":
+					setLastAppliedConfigAnnotation(podSecond1)
+					podToReturn = podSecond1
+				case "p22":
+					setLastAppliedConfigAnnotation(podSecond2)
+					podToReturn = podSecond2
+				default:
+					t.Fatalf("unexpected pod name: %s", obj.GetName())
+				}
+
+				podBytes, _ := runtime.Encode(codecPrune, podToReturn)
 				bodyPod := io.NopCloser(bytes.NewReader(podBytes))
 				return &http.Response{StatusCode: http.StatusCreated, Header: cmdtesting.DefaultHeader(), Body: bodyPod}, nil
 
