@@ -4,7 +4,7 @@ metadata:
   labels:
     app: default-http-backend
     test: managed
-  name: default-http-1
+  name: p21
   namespace: second
 spec:
   containers:

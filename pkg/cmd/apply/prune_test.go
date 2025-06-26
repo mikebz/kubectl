@@ -23,6 +23,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/cli-runtime/pkg/genericiooptions"
 	"k8s.io/cli-runtime/pkg/resource"
@@ -33,11 +34,9 @@ import (
 
 const (
 	testDataPath = "testdata/prune/prune-two-ns/"
-	podFirstNs   = "prune-pod-first.yaml"
-	podSecondNs1 = "prune-pod-second-1.yaml"
-	podSecondNs2 = "prune-pod-second-2.yaml"
-	nameFirst    = "default-http-1"
-	nameSecond   = "default-http-1"
+	podFile11    = "prune-pod-first.yaml"
+	podFile21    = "prune-pod-second-1.yaml"
+	podFile22    = "prune-pod-second-2.yaml"
 )
 
 var (
@@ -45,15 +44,25 @@ var (
 )
 
 func TestPruneTwoNamespaces(t *testing.T) {
+
 	cmdtesting.InitTestErrorHandler(t)
 
 	// Read the pod from the first file that will be kept
-	podFirst := readUnstructuredFromFile(t, testDataPath+podFirstNs)
-	pathFirstPod := "/namespaces/first/pods/" + nameFirst
-	pathFirstPodsCollection := "/namespaces/first/pods"
+	podFirst := readUnstructuredFromFile(t, testDataPath+podFile11)
+	urlFirstPod := "/namespaces/first/pods/p11"
+	firstPodsCollection := "/namespaces/first/pods"
+	podSecond1 := readUnstructuredFromFile(t, testDataPath+podFile21)
+	podSecond2 := readUnstructuredFromFile(t, testDataPath+podFile22)
+	urlSecondPod1 := "/namespaces/second/pods/p21"
+	urlSecondPod2 := "/namespaces/second/pods/p22"
+	secondPodsCollection := "/namespaces/second/pods"
 
 	tf := cmdtesting.NewTestFactory()
 	defer tf.Cleanup()
+
+	firstPodDeleted := false
+	secondPod1Deleted := false
+	secondPod2Deleted := false
 
 	// Set up the fake REST client to handle HTTP requests
 	tf.UnstructuredClient = &fake.RESTClient{
@@ -80,17 +89,61 @@ func TestPruneTwoNamespaces(t *testing.T) {
 					}
 				}`
 				return &http.Response{StatusCode: http.StatusOK, Header: cmdtesting.DefaultHeader(), Body: io.NopCloser(strings.NewReader(nsResponse))}, nil
-			case p == pathFirstPod && m == "GET":
-				// Return 404 to simulate the pod doesn't exist yet
-				return &http.Response{StatusCode: http.StatusNotFound, Header: cmdtesting.DefaultHeader(), Body: io.NopCloser(strings.NewReader(""))}, nil
-			case p == pathFirstPodsCollection && m == "POST":
+
+			// All the GETs
+			case p == urlFirstPod && (m == "GET" || m == "PATCH"):
+				podBytes, _ := runtime.Encode(codecPrune, podFirst)
+				bodyPod := io.NopCloser(bytes.NewReader(podBytes))
+				return &http.Response{StatusCode: http.StatusOK, Header: cmdtesting.DefaultHeader(), Body: bodyPod}, nil
+			case p == urlSecondPod1 && (m == "GET" || m == "PATCH"):
+				podBytes, _ := runtime.Encode(codecPrune, podSecond1)
+				bodyPod := io.NopCloser(bytes.NewReader(podBytes))
+				return &http.Response{StatusCode: http.StatusOK, Header: cmdtesting.DefaultHeader(), Body: bodyPod}, nil
+			case p == urlSecondPod2 && (m == "GET" || m == "PATCH"):
+				podBytes, _ := runtime.Encode(codecPrune, podSecond2)
+				bodyPod := io.NopCloser(bytes.NewReader(podBytes))
+				return &http.Response{StatusCode: http.StatusOK, Header: cmdtesting.DefaultHeader(), Body: bodyPod}, nil
+
+			// All the POSTs
+			case p == firstPodsCollection && m == "POST":
 				// Create the pod in first namespace
 				podBytes, _ := runtime.Encode(codecPrune, podFirst)
 				bodyPod := io.NopCloser(bytes.NewReader(podBytes))
 				return &http.Response{StatusCode: http.StatusCreated, Header: cmdtesting.DefaultHeader(), Body: bodyPod}, nil
-			case strings.HasPrefix(p, "/namespaces/first/pods") && m == "GET" && strings.Contains(p, "?"):
+			case p == secondPodsCollection && m == "POST":
+				// Create the pod in second namespace
+				podBytes, _ := runtime.Encode(codecPrune, podSecond1)
+				bodyPod := io.NopCloser(bytes.NewReader(podBytes))
+				return &http.Response{StatusCode: http.StatusCreated, Header: cmdtesting.DefaultHeader(), Body: bodyPod}, nil
+
+			// All the DELETE
+			case p == urlFirstPod && m == "DELETE":
+				// Delete the first pod in second namespace
+				firstPodDeleted = true
+				podBytes, _ := runtime.Encode(codecPrune, podFirst)
+				bodyPod := io.NopCloser(bytes.NewReader(podBytes))
+				return &http.Response{StatusCode: http.StatusOK, Header: cmdtesting.DefaultHeader(), Body: bodyPod}, nil
+			case p == urlSecondPod1 && m == "DELETE":
+				// Delete the first pod in second namespace
+				secondPod1Deleted = true
+				podBytes, _ := runtime.Encode(codecPrune, podSecond1)
+				bodyPod := io.NopCloser(bytes.NewReader(podBytes))
+				return &http.Response{StatusCode: http.StatusOK, Header: cmdtesting.DefaultHeader(), Body: bodyPod}, nil
+			case p == urlSecondPod2 && m == "DELETE":
+				// Delete the second pod in second namespace
+				secondPod2Deleted = true
+				podBytes, _ := runtime.Encode(codecPrune, podSecond2)
+				bodyPod := io.NopCloser(bytes.NewReader(podBytes))
+				return &http.Response{StatusCode: http.StatusOK, Header: cmdtesting.DefaultHeader(), Body: bodyPod}, nil
+
+			// all the LISTS
+			case strings.HasPrefix(p, firstPodsCollection) && m == "GET" && strings.Contains(p, "?"):
 				// Handle list requests for pruning - return empty lists
 				return &http.Response{StatusCode: http.StatusOK, Header: cmdtesting.DefaultHeader(), Body: io.NopCloser(strings.NewReader(`{"kind":"List","apiVersion":"v1","items":[]}`))}, nil
+			case strings.HasPrefix(p, secondPodsCollection) && m == "GET" && strings.Contains(p, "?"):
+				// Handle list requests for pruning - return empty lists
+				return &http.Response{StatusCode: http.StatusOK, Header: cmdtesting.DefaultHeader(), Body: io.NopCloser(strings.NewReader(`{"kind":"List","apiVersion":"v1","items":[]}`))}, nil
+
 			default:
 				t.Fatalf("unexpected request: %s %s", m, p)
 				return nil, nil
@@ -101,16 +154,23 @@ func TestPruneTwoNamespaces(t *testing.T) {
 
 	ioStreams, _, buf, errBuf := genericiooptions.NewTestIOStreams()
 	cmd := NewCmdApply("kubectl", tf, ioStreams)
-	cmd.Flags().Set("filename", testDataPath+podFirstNs)
+	cmd.Flags().Set("filename", testDataPath+podFile11)
+	cmd.Flags().Set("filename", testDataPath+podFile21)
+	cmd.Flags().Set("filename", testDataPath+podFile22)
 	cmd.Flags().Set("output", "name")
 	cmd.Run(cmd, []string{})
 
-	// Check that the pod was applied successfully
-	expectedOutput := "pod/" + nameFirst + "\n"
-	if buf.String() != expectedOutput {
-		t.Fatalf("unexpected output: %s\nexpected: %s", buf.String(), expectedOutput)
-	}
+	// we have asked for the names to be output so we should get all of them in the output string
+	outString := buf.String()
+	assert.Contains(t, outString, "pod/p11")
+	assert.Contains(t, outString, "pod/p21")
+	assert.Contains(t, outString, "pod/p22")
 	if errBuf.String() != "" {
 		t.Fatalf("unexpected error output: %s", errBuf.String())
 	}
+
+	// at this point in time none of our pods should be deleted.
+	assert.False(t, firstPodDeleted, "first pod should not be deleted")
+	assert.False(t, secondPod1Deleted, "second pod 1 should not be deleted")
+	assert.False(t, secondPod2Deleted, "second pod 2 should not be deleted")
 }
