@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"io"
 	"net/http"
+	"path"
 	"strings"
 	"testing"
 
@@ -40,6 +41,11 @@ const (
 	podFile22    = "prune-pod-second-2.yaml"
 )
 
+const (
+	firstPodsCollection  = "/namespaces/first/pods"
+	secondPodsCollection = "/namespaces/second/pods"
+)
+
 var (
 	codecPrune = scheme.Codecs.LegacyCodec(scheme.Scheme.PrioritizedVersionsAllGroups()...)
 )
@@ -50,26 +56,38 @@ func TestPruneTwoNamespaces(t *testing.T) {
 
 	// Read the pod from the first file that will be kept
 	podFirst := readUnstructuredFromFile(t, testDataPath+podFile11)
-	urlFirstPod := "/namespaces/first/pods/p11"
-	firstPodsCollection := "/namespaces/first/pods"
+
 	podSecond1 := readUnstructuredFromFile(t, testDataPath+podFile21)
 	podSecond2 := readUnstructuredFromFile(t, testDataPath+podFile22)
-	urlSecondPod1 := "/namespaces/second/pods/p21"
-	urlSecondPod2 := "/namespaces/second/pods/p22"
-	secondPodsCollection := "/namespaces/second/pods"
 
 	tf := cmdtesting.NewTestFactory()
 	defer tf.Cleanup()
 
-	firstPodDeleted := false
-	secondPod1Deleted := false
-	secondPod2Deleted := false
+	// these are created for simple book keeping an ease of lookup.
+	// the book keeping is made in the most simple way possible to avoid creating a lot of test code.
+	// the pods are specifically named so that you don't have to even keep track of a namespace.
+	podMap := map[string]*unstructured.Unstructured{
+		"p11": podFirst,
+		"p21": podSecond1,
+		"p22": podSecond2,
+	}
+
+	podExistMap := map[string]bool{
+		"p11": false,
+		"p21": false,
+		"p22": false,
+	}
 
 	// Set up the fake REST client to handle HTTP requests
+	// NOTE that a lot of the error cases are not handled here to avoid generating too much test code.
+	// we would rather see a "panic" than add handlers where we don't expect
 	tf.UnstructuredClient = &fake.RESTClient{
 		NegotiatedSerializer: resource.UnstructuredPlusDefaultContentConfig().NegotiatedSerializer,
 		Client: fake.CreateHTTPClient(func(req *http.Request) (*http.Response, error) {
 			switch p, m := req.URL.Path, req.Method; {
+
+			// Handle all the namespace GET's they all "exist"
+
 			case strings.HasPrefix(p, "/api/v1/namespaces/") && m == "GET":
 				namespace := strings.TrimPrefix(p, "/api/v1/namespaces/")
 				// Return namespace exists
@@ -85,78 +103,57 @@ func TestPruneTwoNamespaces(t *testing.T) {
 					Header:     cmdtesting.DefaultHeader(),
 					Body:       io.NopCloser(strings.NewReader(nsResponse))}, nil
 
+			// all the LISTS
+			case strings.HasPrefix(p, firstPodsCollection) && m == "GET" && strings.Contains(p, "?"):
+				// Return list with p11 pod for first namespace
+				pb, _ := runtime.Encode(codecPrune, podMap["p11"])
+				listResponse := `{"kind":"List","apiVersion":"v1","items":[` + string(pb) + `]}`
+				return &http.Response{StatusCode: http.StatusOK, Header: cmdtesting.DefaultHeader(), Body: io.NopCloser(strings.NewReader(listResponse))}, nil
+			case strings.HasPrefix(p, secondPodsCollection) && m == "GET" && strings.Contains(p, "?"):
+				// Handle the list response for pruning
+				p1b, _ := runtime.Encode(codecPrune, podMap["p21"])
+				p2b, _ := runtime.Encode(codecPrune, podMap["p22"])
+				listResponse := `{"kind":"List","apiVersion":"v1","items":[` + string(p1b) + `,` + string(p2b) + `]}`
+				return &http.Response{StatusCode: http.StatusOK, Header: cmdtesting.DefaultHeader(), Body: io.NopCloser(strings.NewReader(listResponse))}, nil
+
 			// All the GETs return 404
 			// the reason is that if we return the objects here kubectl decides that they already
 			// exist and tries to do a patch.
-			case (p == urlFirstPod || p == urlSecondPod1 || p == urlSecondPod2) && m == "GET":
-				// Simulate not found for GET and PATCH
-				return &http.Response{
-					StatusCode: http.StatusNotFound,
-					Header:     cmdtesting.DefaultHeader(),
-					Body:       io.NopCloser(strings.NewReader(``)),
-				}, nil
+			case urlInCollections(p) && (m == "GET" || m == "PATCH"):
+				name := path.Base(p)
 
-			// All the POSTs
-			case p == firstPodsCollection && m == "POST":
-				// Create the pod in first namespace
+				if !podExistMap[name] {
+					// If the pod does not exist, return 404
+					return &http.Response{
+						StatusCode: http.StatusNotFound,
+						Header:     cmdtesting.DefaultHeader(),
+					}, nil
+				}
+
+				pod := podMap[name]
+				podBytes, _ := runtime.Encode(codecPrune, pod)
+				bodyPod := io.NopCloser(bytes.NewReader(podBytes))
+				return &http.Response{StatusCode: http.StatusOK, Header: cmdtesting.DefaultHeader(), Body: bodyPod}, nil
+
+			// All the Pod POSTs
+			case urlInCollections(p) && m == "POST":
+
+				name := readPodName(t, req.Body)
+				podExistMap[name] = true
+				pod := podMap[name]
 				setLastAppliedConfigAnnotation(podFirst)
-				podBytes, _ := runtime.Encode(codecPrune, podFirst)
-				bodyPod := io.NopCloser(bytes.NewReader(podBytes))
-				return &http.Response{StatusCode: http.StatusCreated, Header: cmdtesting.DefaultHeader(), Body: bodyPod}, nil
-			case p == secondPodsCollection && m == "POST":
-				// Create the pod in second namespace
-				bodyBytes, err := io.ReadAll(req.Body)
-				if err != nil {
-					t.Fatalf("unexpected error: %v", err)
-				}
-				obj := &unstructured.Unstructured{}
-				if err := runtime.DecodeInto(codecPrune, bodyBytes, obj); err != nil {
-					t.Fatalf("unexpected error: %v", err)
-				}
-
-				var podToReturn *unstructured.Unstructured
-				switch obj.GetName() {
-				case "p21":
-					setLastAppliedConfigAnnotation(podSecond1)
-					podToReturn = podSecond1
-				case "p22":
-					setLastAppliedConfigAnnotation(podSecond2)
-					podToReturn = podSecond2
-				default:
-					t.Fatalf("unexpected pod name: %s", obj.GetName())
-				}
-
-				podBytes, _ := runtime.Encode(codecPrune, podToReturn)
+				podBytes, _ := runtime.Encode(codecPrune, pod)
 				bodyPod := io.NopCloser(bytes.NewReader(podBytes))
 				return &http.Response{StatusCode: http.StatusCreated, Header: cmdtesting.DefaultHeader(), Body: bodyPod}, nil
 
-			// All the DELETE
-			case p == urlFirstPod && m == "DELETE":
-				// Delete the first pod in second namespace
-				firstPodDeleted = true
-				podBytes, _ := runtime.Encode(codecPrune, podFirst)
+			// All the DELETEs
+			case urlInCollections(p) && m == "DELETE":
+				name := path.Base(p)
+				podExistMap[name] = false
+				pod := podMap[name]
+				podBytes, _ := runtime.Encode(codecPrune, pod)
 				bodyPod := io.NopCloser(bytes.NewReader(podBytes))
 				return &http.Response{StatusCode: http.StatusOK, Header: cmdtesting.DefaultHeader(), Body: bodyPod}, nil
-			case p == urlSecondPod1 && m == "DELETE":
-				// Delete the first pod in second namespace
-				secondPod1Deleted = true
-				podBytes, _ := runtime.Encode(codecPrune, podSecond1)
-				bodyPod := io.NopCloser(bytes.NewReader(podBytes))
-				return &http.Response{StatusCode: http.StatusOK, Header: cmdtesting.DefaultHeader(), Body: bodyPod}, nil
-			case p == urlSecondPod2 && m == "DELETE":
-				// Delete the second pod in second namespace
-				secondPod2Deleted = true
-				podBytes, _ := runtime.Encode(codecPrune, podSecond2)
-				bodyPod := io.NopCloser(bytes.NewReader(podBytes))
-				return &http.Response{StatusCode: http.StatusOK, Header: cmdtesting.DefaultHeader(), Body: bodyPod}, nil
-
-			// all the LISTS
-			case strings.HasPrefix(p, firstPodsCollection) && m == "GET" && strings.Contains(p, "?"):
-				// Handle list requests for pruning - return empty lists
-				return &http.Response{StatusCode: http.StatusOK, Header: cmdtesting.DefaultHeader(), Body: io.NopCloser(strings.NewReader(`{"kind":"List","apiVersion":"v1","items":[]}`))}, nil
-			case strings.HasPrefix(p, secondPodsCollection) && m == "GET" && strings.Contains(p, "?"):
-				// Handle list requests for pruning - return empty lists
-				return &http.Response{StatusCode: http.StatusOK, Header: cmdtesting.DefaultHeader(), Body: io.NopCloser(strings.NewReader(`{"kind":"List","apiVersion":"v1","items":[]}`))}, nil
 
 			default:
 				t.Fatalf("unexpected request: %s %s", m, p)
@@ -174,17 +171,49 @@ func TestPruneTwoNamespaces(t *testing.T) {
 	cmd.Flags().Set("output", "name")
 	cmd.Run(cmd, []string{})
 
-	// we have asked for the names to be output so we should get all of them in the output string
-	outString := buf.String()
-	assert.Contains(t, outString, "pod/p11")
-	assert.Contains(t, outString, "pod/p21")
-	assert.Contains(t, outString, "pod/p22")
 	if errBuf.String() != "" {
 		t.Fatalf("unexpected error output: %s", errBuf.String())
 	}
 
+	// we have asked for the names to be output so we should get all of them in the output string
+	outString := buf.String()
 	// at this point in time none of our pods should be deleted.
-	assert.False(t, firstPodDeleted, "first pod should not be deleted")
-	assert.False(t, secondPod1Deleted, "second pod 1 should not be deleted")
-	assert.False(t, secondPod2Deleted, "second pod 2 should not be deleted")
+	// and they all should be represented in the output
+	for name, exists := range podExistMap {
+		assert.True(t, exists, "pod %s should not be deleted", name)
+		assert.Contains(t, outString, "pod/"+name)
+	}
+
+	// the second run should prune the p2* pods
+	ioStreams, _, _, errBuf = genericiooptions.NewTestIOStreams()
+	cmd = NewCmdApply("kubectl", tf, ioStreams)
+	cmd.Flags().Set("filename", testDataPath+podFile11)
+	cmd.Flags().Set("prune", "true")
+	cmd.Flags().Set("selector", "test=managed")
+	cmd.Run(cmd, []string{})
+	if errBuf.String() != "" {
+		t.Fatalf("unexpected error output: %s", errBuf.String())
+	}
+
+	assert.False(t, podExistMap["p21"], "pod p21 should be deleted")
+	assert.False(t, podExistMap["p22"], "pod p22 should be deleted")
+}
+
+// urlInCollections checks if the given URL is part of the collections we are interested in.
+func urlInCollections(url string) bool {
+	return strings.HasPrefix(url, firstPodsCollection) ||
+		strings.HasPrefix(url, secondPodsCollection)
+}
+
+// readUnstructuredFromFile reads a request body and returns a names
+func readPodName(t *testing.T, body io.ReadCloser) string {
+	bodyBytes, err := io.ReadAll(body)
+	if err != nil {
+		t.Fatalf("failed to read request body: %v", err)
+	}
+	obj := &unstructured.Unstructured{}
+	if err := runtime.DecodeInto(codecPrune, bodyBytes, obj); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	return obj.GetName()
 }
