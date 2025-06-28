@@ -177,8 +177,10 @@ func (p *pruner) getNamespacesToPrune(o *ApplyOptions) ([]string, error) {
 	// Always include visited namespaces from the current apply operation
 	namespacesToPrune.Insert(sets.List(p.visitedNamespaces)...)
 
-	// If a specific namespace is set, only consider that namespace
-	if o.Namespace != "" {
+	// If a specific namespace is set and it's not the enforced default namespace,
+	// only consider that namespace. We need to check if the namespace was explicitly
+	// set by the user vs. defaulted by kubectl.
+	if o.EnforceNamespace {
 		namespacesToPrune.Insert(o.Namespace)
 		return sets.List(namespacesToPrune), nil
 	}
