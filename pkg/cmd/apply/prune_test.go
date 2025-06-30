@@ -84,6 +84,7 @@ func TestPruneTwoNamespaces(t *testing.T) {
 	tf.UnstructuredClient = &fake.RESTClient{
 		NegotiatedSerializer: resource.UnstructuredPlusDefaultContentConfig().NegotiatedSerializer,
 		Client: fake.CreateHTTPClient(func(req *http.Request) (*http.Response, error) {
+			t.Logf("request: %s %s", req.Method, req.URL.Path)
 			switch p, m := req.URL.Path, req.Method; {
 
 			// Handle all the namespace GET's they all "exist"
@@ -111,9 +112,16 @@ func TestPruneTwoNamespaces(t *testing.T) {
 				return &http.Response{StatusCode: http.StatusOK, Header: cmdtesting.DefaultHeader(), Body: io.NopCloser(strings.NewReader(listResponse))}, nil
 			case strings.HasPrefix(p, secondPodsCollection) && m == "GET" && strings.Contains(p, "?"):
 				// Handle the list response for pruning
-				p1b, _ := runtime.Encode(codecPrune, podMap["p21"])
-				p2b, _ := runtime.Encode(codecPrune, podMap["p22"])
-				listResponse := `{"kind":"List","apiVersion":"v1","items":[` + string(p1b) + `,` + string(p2b) + `]}`
+				items := []string{}
+				if podExistMap["p21"] {
+					p1b, _ := runtime.Encode(codecPrune, podMap["p21"])
+					items = append(items, string(p1b))
+				}
+				if podExistMap["p22"] {
+					p2b, _ := runtime.Encode(codecPrune, podMap["p22"])
+					items = append(items, string(p2b))
+				}
+				listResponse := `{"kind":"List","apiVersion":"v1","items":[` + strings.Join(items, ",") + `]}`
 				return &http.Response{StatusCode: http.StatusOK, Header: cmdtesting.DefaultHeader(), Body: io.NopCloser(strings.NewReader(listResponse))}, nil
 
 			// All the GETs return 404
@@ -141,7 +149,7 @@ func TestPruneTwoNamespaces(t *testing.T) {
 				name := readPodName(t, req.Body)
 				podExistMap[name] = true
 				pod := podMap[name]
-				setLastAppliedConfigAnnotation(podFirst)
+				setLastAppliedConfigAnnotation(pod)
 				podBytes, _ := runtime.Encode(codecPrune, pod)
 				bodyPod := io.NopCloser(bytes.NewReader(podBytes))
 				return &http.Response{StatusCode: http.StatusCreated, Header: cmdtesting.DefaultHeader(), Body: bodyPod}, nil
@@ -163,6 +171,7 @@ func TestPruneTwoNamespaces(t *testing.T) {
 	}
 	tf.ClientConfigVal = cmdtesting.DefaultClientConfig()
 
+	t.Logf("Running apply command to create p11, p21 and p22 pods")
 	ioStreams, _, buf, errBuf := genericiooptions.NewTestIOStreams()
 	cmd := NewCmdApply("kubectl", tf, ioStreams)
 	cmd.Flags().Set("filename", testDataPath+podFile11)
@@ -185,6 +194,7 @@ func TestPruneTwoNamespaces(t *testing.T) {
 	}
 
 	// the second run should prune the p2* pods
+	t.Logf("Running prune command to delete p21 and p22 pods")
 	ioStreams, _, _, errBuf = genericiooptions.NewTestIOStreams()
 	cmd = NewCmdApply("kubectl", tf, ioStreams)
 	cmd.Flags().Set("filename", testDataPath+podFile11)
